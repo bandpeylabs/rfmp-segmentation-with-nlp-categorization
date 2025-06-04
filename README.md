@@ -26,7 +26,7 @@ Traditional **RFM** segmentation (Recency, Frequency, Monetary value) provides a
 - 🧹 `01-data-preparation.py`  
   Clean, preprocess, and vectorize product names using NLP
 
-- 🤖 `02-product-clustering.py`  
+- 🤖 `02-exploratory-data-analysis.py`  
   Cluster products into interpretable categories using embeddings + KMeans
 
 - 📊 `03-rfmp-segmentation.py`  
