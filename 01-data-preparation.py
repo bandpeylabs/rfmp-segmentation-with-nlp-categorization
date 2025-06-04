@@ -86,58 +86,18 @@ display(orders_bronze_df)
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC #  Build a TF-IDF pipeline in Spark
 # MAGIC - Loads the bronze table (orders_bronze)
-# MAGIC - Uses bert_base_uncased as a Spark UDF to compute an embedding vector for each distinct “Description”
-# MAGIC - Joins those embeddings back into the original DataFrame
-# MAGIC - Writes that augmented DataFrame (with one extra embedding column) out as our silver table (orders_silver)
-# MAGIC 	
-# MAGIC ⸻
-# MAGIC
-# MAGIC 📒 Prerequisites
-# MAGIC - You have already installed gte_small (Marketplace model) into your workspace under the Catalog databricks_gte_models.
-# MAGIC - You are running on a Databricks cluster with at least ML Runtime 14.x (or a runtime that supports mlflow.pyfunc.spark_udf).
-# MAGIC - Your cluster already has scikit-learn and pandas available (if not, you can install them in a separate %pip install ... cell).
+# MAGIC - ...
 
 # COMMAND ----------
 
-# DBTITLE 1,Define & Register the BERT UDF
-# Cell 2 (fixed): skip null/empty Descriptions before tokenizing
+# DBTITLE 1,Read bronze and extract unique descriptions
+# We’ll cluster _distinct_ product descriptions. If you only want to 
+# cluster each unique product once, do .distinct(). Otherwise cluster all rows.
+distinct_desc_df = orders_bronze_df.select("Description").where("Description IS NOT NULL").distinct()
 
-from transformers import AutoTokenizer, AutoModel
-import torch
-
-# 1) Load tokenizer & model once
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-model     = AutoModel.from_pretrained("bert-base-uncased")
-model.eval()
-
-# 2) Define a safe embedding function that returns a 768‐dim zero vector if input is null/empty
-ZERO_VEC = [0.0] * 768
-
-def embed_text(text: str) -> list[float]:
-    if not text:  # catches None or empty string
-        return ZERO_VEC
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    emb = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-    return emb.tolist()
-
-# 3) Register as Spark UDF
-from pyspark.sql.functions import udf
-from pyspark.sql.types import ArrayType, FloatType
-
-embed_udf = udf(embed_text, ArrayType(FloatType()))
-spark.udf.register("embed_text", embed_text, ArrayType(FloatType()))
-
-# 4) Test on a DataFrame instead of a single string
-test_df = spark.createDataFrame(
-    [("WHITE HANGING HEART T-LIGHT HOLDER",), ("RED WOOLLY HOTTIE WHITE HEART",)],
-    ["Description"]
-)
-
-emb_df = test_df.withColumn("embedding", embed_udf("Description"))
-display(emb_df)
+display(distinct_desc_df)
 
 # COMMAND ----------
 
@@ -148,209 +108,162 @@ display(emb_df)
 
 # COMMAND ----------
 
-# DBTITLE 1,Generate & Persist 768-dim Embeddings (Silver)
-from pyspark.sql.functions import udf
-from pyspark.sql.types import ArrayType, FloatType
+# DBTITLE 1,Tokenize + remove English stop words → raw “words” column
+from pyspark.ml.feature import Tokenizer, StopWordsRemover
 
+tokenizer = Tokenizer(inputCol="Description", outputCol="words_raw")
+stop_remover = StopWordsRemover(inputCol="words_raw", outputCol="words")
 
-embed_udf = udf(embed_text, ArrayType(FloatType()))
+tokenized_df = tokenizer.transform(distinct_desc_df)
+clean_df     = stop_remover.transform(tokenized_df)
 
-orders_bronze_df = spark.read.table("demos.rfmp_segmentation.orders_bronze")
-
-orders_silver = (
-    orders_bronze_df
-      .withColumn("embedding", embed_udf("Description"))
-      .write
-      .mode("overwrite")
-      .format("delta")
-      .saveAsTable("demos.rfmp_segmentation.orders_silver")
-)
+# Show token lists
+display(clean_df.select("Description", "words").limit(5))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC At this point, orders_silver has schema:
-# MAGIC ```
-# MAGIC root
-# MAGIC  |-- Description: string (nullable = true)
-# MAGIC  |-- embedding: array<float> (nullable = true, length 768)
-# MAGIC ```
+# MAGIC At this point...
 
 # COMMAND ----------
 
-# DBTITLE 1,Run SparkPCA on the 768-dim Column
+# DBTITLE 1,HashingTF → “tf_features”  (sparse term frequencies)
+# followed by IDF → “tfidf_features”
+from pyspark.ml.feature import HashingTF, IDF
+
+hashing_tf = HashingTF(
+    inputCol="words",
+    outputCol="tf_features",
+    numFeatures=4096    # you can adjust (e.g. 2048, 4096, 8192). 4096 is a decent trade-off.
+)
+
+# First apply HashingTF to get raw counts
+tf_df = hashing_tf.transform(clean_df)
+
+idf = IDF(inputCol="tf_features", outputCol="tfidf_features", minDocFreq=2)
+idf_model = idf.fit(tf_df)          # fit on all distinct descriptions
+tfidf_df = idf_model.transform(tf_df)
+
+# tfidf_df now contains “tfidf_features” column of type Vector (dim = 4096)
+display(tfidf_df.select("Description", "tfidf_features").limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Dimensionality Reduction
+# MAGIC
+# MAGIC Clustering directly on a 4096-dim TF-IDF can work, but if you want to speed things up further, reduce to ~50 or 100 dims first using PCA or TruncatedSVD.
+
+# COMMAND ----------
+
+# DBTITLE 1,Using Spark PCA (distributed)
+# SparkPCA to cut down 4096 → 50
 from pyspark.ml.feature import PCA as SparkPCA
-from pyspark.ml.linalg import Vectors, VectorUDT
-from pyspark.sql.functions import udf, col
-from pyspark.sql.types import ArrayType, FloatType
 
-# 2.1) Read your silver table
-silver_df = spark.read.table("demos.rfmp_segmentation.orders_silver") \
-                .select("Description", "embedding") \
-                .distinct()  # one row per distinct Description
-
-# 2.2) Convert the Python array<float> → Spark Dense Vector
-to_vector_udf = udf(lambda arr: Vectors.dense(arr), VectorUDT())
-
-vector_df = silver_df.withColumn("features", to_vector_udf(col("embedding")))
-
-# 2.3) Run PCA (reduce 768 → e.g. 50 dimensions)
-pca = SparkPCA(k=50, inputCol="features", outputCol="pca_features")
-pca_model = pca.fit(vector_df)
-pca_df = pca_model.transform(vector_df) \
-                  .select("Description", "pca_features")
-
-display(pca_df.limit(10))
-
-# COMMAND ----------
-
-# DBTITLE 1,Write Out the Silver Table (with Embeddings)
-# 5.1 Write the augmented DataFrame to a Delta table as "orders_silver"
-(
-    orders_silver_intermediate
-      .write
-      .mode("overwrite")
-      .format("delta")
-      .saveAsTable("demos.rfmp_segmentation.orders_silver")
+pca = SparkPCA(
+    k=50,
+    inputCol="tfidf_features",
+    outputCol="pca_features"
 )
+pca_model = pca.fit(tfidf_df)
+pca_df    = pca_model.transform(tfidf_df)
 
-print("✅ Silver table created: demos.rfmp_segmentation.orders_silver")
+# “pca_features” is now a Vector of length 50
+display(pca_df.select("Description", "pca_features").limit(5))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Now we have all embeddings stored in orders_silver, the usual workflow is:
-# MAGIC - Collect only (Description, embedding) from orders_silver into a Pandas DataFrame
-# MAGIC - Run KMeans (10 clusters) locally, assign each distinct Description → ProductCategoryID
-# MAGIC - Manually name each cluster (e.g. “Lighting,” “Home Decor,” etc.)
-# MAGIC - Create a small Spark lookup of (Description → ProductCategoryID, ProductCategoryName)
-# MAGIC - Join that lookup back onto orders_silver → you get an enriched DataFrame with two new columns
-# MAGIC   - ProductCategoryID (Int 0..9)
-# MAGIC   - ProductCategoryName (string)
-# MAGIC - Write that final DataFrame out as the gold table orders_gold
+# MAGIC # KMeans on TF-IDF or PCA output
+# MAGIC
+# MAGIC Cluster on the 50-dim pca_features.
 
 # COMMAND ----------
 
-# DBTITLE 1,Collect Embeddings Locally & Cluster in Pandas/Scikit-Learn
-# Cell 6: Collect (Description, embedding) to Pandas for clustering
-import pandas as pd
+# DBTITLE 1,KMeans (k=10) on the 50-dim PCA vectors
+# Cell 5: KMeans (k=10) on the 50-dim PCA vectors
+from pyspark.ml.clustering import KMeans
 
-# 6.1 Read only the two columns from silver
-silver_df = spark.read.table("demos.rfmp_segmentation.orders_silver") \
-                    .select("Description", "embedding") \
-                    .distinct() \
-                    .na.drop(subset=["embedding"])
+kmeans = KMeans(
+    k=10,
+    seed=42,
+    featuresCol="pca_features",
+    predictionCol="ProductCategoryID"
+)
+kmeans_model = kmeans.fit(pca_df)
+clusters_df  = kmeans_model.transform(pca_df)
 
-# 6.2 Convert to Pandas (embedding is array<float>, Pandas will see it as list[float])
-silver_pd = silver_df.toPandas()
+# clusters_df schema: (Description: string, words_raw, words, tf_features, 
+#                      tfidf_features, pca_features, ProductCategoryID: int)
+display(clusters_df.select("Description", "ProductCategoryID").limit(10))
 
-# 6.3 Split out embeddings into a 2D array for clustering
-import numpy as np
+# COMMAND ----------
 
-emb_matrix = np.vstack(silver_pd["embedding"].values)  
-print("emb_matrix shape:", emb_matrix.shape)  # should be (num_distinct_desc, 384)
-
-# 6.4 Run KMeans for 10 clusters
-from sklearn.cluster import KMeans
-
-n_clusters = 10
-kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=20)
-silver_pd["ProductCategoryID"] = kmeans.fit_predict(emb_matrix)
-
-# 6.5 Inspect a few examples per cluster, so you can name them manually
-for cid in range(n_clusters):
-    sample_texts = silver_pd[silver_pd.ProductCategoryID == cid]["Description"] \
-                                .sample(5, random_state=42).tolist()
-    print(f"\nCluster {cid} samples:\n", sample_texts)
+# MAGIC %md
+# MAGIC # Inspect cluster contents
 
 # COMMAND ----------
 
 # DBTITLE 1,Manually Map Cluster IDs → Category Names
-# Cell 7: after inspecting the cluster samples, fill in your own names:
-category_name_map = {
-    0: "Lighting",
-    1: "Home Decor",
-    2: "Kitchen & Tableware",
-    3: "Toys & Crafts",
-    4: "Seasonal Goods",
-    5: "Textiles & Linens",
-    6: "Office & Stationery",
-    7: "Garden & Outdoors",
-    8: "Bathroom & Wellness",
-    9: "Miscellaneous"
-}
-
-# Convert that mapping into a tiny Pandas DataFrame
-mapping_pd = pd.DataFrame({
-    "ProductCategoryID": list(category_name_map.keys()),
-    "ProductCategoryName": list(category_name_map.values())
-})
-
-display(mapping_pd)
+# Cell 6: show a few sample descriptions per cluster
+for cid in range(10):
+    print(f"\nCluster {cid} samples:")
+    clusters_df.filter(f"ProductCategoryID = {cid}") \
+               .select("Description") \
+               .limit(10) \
+               .show(truncate=False)
 
 # COMMAND ----------
 
-# DBTITLE 1,Create a Spark Lookup for Description → (CategoryID, CategoryName)
-from pyspark.sql import Row
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+# MAGIC %md
+# MAGIC # Join cluster IDs back to orders
+# MAGIC
+# MAGIC Now that each unique Description has a ProductCategoryID, join back onto your full orders table and write out a Silver (or Gold) version:
 
-# 8.1 Build a DataFrame: [ Description, ProductCategoryID ] from silver_pd
-schema_desc_map = StructType([
-    StructField("Description", StringType(), nullable=False),
-    StructField("ProductCategoryID", IntegerType(), nullable=False)
-])
+# COMMAND ----------
 
-desc_rows = [
-    Row(Description=row["Description"], ProductCategoryID=int(row["ProductCategoryID"]))
-    for _, row in silver_pd.iterrows()
+# DBTITLE 1,Attach cluster names and save lookup to Silver
+from pyspark.sql.functions import col
+
+# 1) Read the original bronze table
+orders_bronze_df = spark.read.table("demos.rfmp_segmentation.orders_bronze")
+
+# 2) Define the mapping from ProductCategoryID → ClusterName
+cluster_name_list = [
+    (0, "Candleware Collection"),
+    (1, "Decorative Stationery"),
+    (2, "Tealight Essentials"),
+    (3, "Gardenware Assortment"),
+    (4, "Novelty Bathroomware"),
+    (5, "Heart Motif Decor"),
+    (6, "Vintage Bagline"),
+    (7, "Wallpiece Selection"),
+    (8, "Photoframe Picks"),
+    (9, "Bakeware Series")
 ]
-desc_map_spark = spark.createDataFrame(desc_rows, schema_desc_map)
-
-# 8.2 Build a DataFrame: [ ProductCategoryID, ProductCategoryName ] from mapping_pd
-schema_cat_name = StructType([
-    StructField("ProductCategoryID", IntegerType(), nullable=False),
-    StructField("ProductCategoryName", StringType(), nullable=False)
-])
-
-catname_rows = [
-    Row(ProductCategoryID=int(r.ProductCategoryID), ProductCategoryName=r.ProductCategoryName)
-    for r in mapping_pd.itertuples()
-]
-catname_map_spark = spark.createDataFrame(catname_rows, schema=schema_cat_name)
-
-# 8.3 Join them so we have [ Description, ProductCategoryID, ProductCategoryName ]
-description_to_cat_spark = desc_map_spark.join(
-    catname_map_spark,
-    on="ProductCategoryID",
-    how="left"
+cluster_names_df = spark.createDataFrame(
+    cluster_name_list,
+    schema=["ProductCategoryID", "ClusterName"]
 )
 
-display(description_to_cat_spark.limit(10))
-
-# COMMAND ----------
-
-# DBTITLE 1,Join Categories Back onto Silver → Enrich & Write Gold
-# Cell 9: read silver table, then join on Description → add two new columns
-orders_silver_df = spark.read.table("demos.rfmp_segmentation.orders_silver")
-
-# 9.1 Join to bring in both ID and Name
-orders_with_final_cat = orders_silver_df.join(
-    description_to_cat_spark,
+# 3) clusters_df (from the KMeans step) must contain: Description, ProductCategoryID
+#    Join orders_bronze to clusters_df to attach ProductCategoryID
+orders_with_id = orders_bronze_df.join(
+    clusters_df.select("Description", "ProductCategoryID"),
     on="Description",
     how="left"
 )
 
-display(orders_with_final_cat.limit(10))
-
-# COMMAND ----------
-
-# 9.2 Write out the “gold” table (final RFMP-ready table)
-(
-    orders_with_final_cat
-      .write
-      .mode("overwrite")
-      .format("delta")
-      .saveAsTable("demos.rfmp_segmentation.orders_gold")
+# 4) Now join cluster_names_df to attach ClusterName
+orders_with_cat = orders_with_id.join(
+    cluster_names_df,
+    on="ProductCategoryID",
+    how="left"
 )
 
-print("✅ Gold table created: demos.rfmp_segmentation.orders_gold")
+# 5) Write out the enriched DataFrame as a new Silver table
+orders_with_cat \
+  .write \
+  .mode("overwrite") \
+  .format("delta") \
+  .saveAsTable("demos.rfmp_segmentation.orders_silver")
