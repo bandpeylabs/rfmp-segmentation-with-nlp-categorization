@@ -173,4 +173,110 @@ plt.show()
 
 # COMMAND ----------
 
+# DBTITLE 1,Evaluate Cluster Size
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+import pyspark.sql.functions as fn
+
+# define max value of k to explore
+max_k = 20
+ 
+# copy binned_pd to each worker node to facilitate parallel evaluation
+inputs_pd_broadcast = sc.broadcast(inputs_pd[['r_bin','f_bin','m_bin']])
+ 
+ 
+# function to train and score clusters based on k cluster count
+@fn.udf('float')
+def get_silhouette(k):
+ 
+  # train a model on k
+  km = KMeans(
+    n_clusters=k, 
+    init='random',
+    n_init=10000
+    )
+  kmeans = km.fit( inputs_pd_broadcast.value )
+ 
+  # get silhouette score for model 
+  silhouette = silhouette_score( 
+      inputs_pd_broadcast.value,  # x values
+      kmeans.predict(inputs_pd_broadcast.value) # cluster assignments 
+      )
+  
+  # return score
+  return float(silhouette)
+ 
+ 
+# assemble an dataframe containing each k value
+iterations = (
+  spark
+    .range(2, max_k + 1, step=1, numPartitions=sc.defaultParallelism) # get values for k
+    .withColumnRenamed('id','k') # rename to k
+    .repartition( max_k-1, 'k' ) # ensure data are well distributed
+    .withColumn('silhouette', get_silhouette('k'))
+  )
+  
+# release the distributed dataset
+inputs_pd_broadcast.unpersist()
+ 
+# display the results of our analysis
+display( 
+  iterations
+      )
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC From our chart, it appears 8 clusters might be a good target number of clusters. Yes, there are higher silhouette scores we could achieve, but it appears from the curve that at 8 clusters, the incremental gains with added clusters begin to decline.
+# MAGIC
+# MAGIC With that in mind, we can define our model to support 8 clusters and finalize our pipeline.
+
+# COMMAND ----------
+
+from sklearn.preprocessing import KBinsDiscretizer, FunctionTransformer
+from sklearn.compose import ColumnTransformer
+
+# defining binning transformation
+binner = KBinsDiscretizer(n_bins=5, encode='ordinal', strategy='quantile')
+ 
+# apply binner to each column
+col_trans = ColumnTransformer(
+  [
+    ('r_bin', binner, ['Recency']),
+    ('f_bin', binner, ['Frequency']),
+    ('m_bin', binner, ['MonetaryValue'])
+    ],
+  remainder='drop'
+  )
+
+# COMMAND ----------
+
+# DBTITLE 1,Assemble & Train Pipeline
+from sklearn.pipeline import Pipeline
+
+# define model
+model = KMeans(
+  n_clusters=8, 
+  init='random',
+  n_init=10000
+  )
+ 
+# couple model with transformations
+pipe = Pipeline(steps=[
+  ('binnerize', col_trans),
+  ('cluster', model)
+  ])
+ 
+# train pipeline
+fitted_pipe = pipe.fit( inputs_pd )
+ 
+# assign clusters
+inputs_pd['cluster'] = pipe.predict( inputs_pd )
+ 
+# display cluster assignments
+display(inputs_pd)
+
+# COMMAND ----------
+
 
