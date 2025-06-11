@@ -228,7 +228,7 @@ from pyspark.sql.functions import col
 # 1) Read the original bronze table
 orders_bronze_df = spark.read.table("demos.rfmp_segmentation.orders_bronze")
 
-# 2) Define the mapping from ProductCategoryID → ClusterName
+# 2) Define the mapping from ProductCategoryID → ProductCategoryName
 cluster_name_list = [
     (0, "Candleware Collection"),
     (1, "Decorative Stationery"),
@@ -243,7 +243,7 @@ cluster_name_list = [
 ]
 cluster_names_df = spark.createDataFrame(
     cluster_name_list,
-    schema=["ProductCategoryID", "ClusterName"]
+    schema=["ProductCategoryID", "ProductCategoryName"]
 )
 
 # 3) clusters_df (from the KMeans step) must contain: Description, ProductCategoryID
@@ -254,7 +254,7 @@ orders_with_id = orders_bronze_df.join(
     how="left"
 )
 
-# 4) Now join cluster_names_df to attach ClusterName
+# 4) Now join cluster_names_df to attach ProductCategoryName
 orders_with_cat = orders_with_id.join(
     cluster_names_df,
     on="ProductCategoryID",

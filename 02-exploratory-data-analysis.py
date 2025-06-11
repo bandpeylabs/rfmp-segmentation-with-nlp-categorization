@@ -22,7 +22,7 @@ orders_consolidated = (
     orders_silver_df
       .filter("SalesAmount > 0.0")                                # exclude returns
       .withColumn("InvoiceDate", fn.to_date("InvoiceDate"))       # drop time component
-      .groupBy("CustomerID", "ProductCategoryID", "ClusterName", "InvoiceDate")
+      .groupBy("CustomerID", "ProductCategoryID", "ProductCategoryName", "InvoiceDate")
         .agg(fn.sum("SalesAmount").alias("DailySales"))           # sum per customer‐category‐date
 )
 
@@ -45,7 +45,7 @@ last_date = (
 rfmp_metrics = (
     orders_consolidated
       .crossJoin(last_date)
-      .groupBy("CustomerID", "ProductCategoryID", "ClusterName")
+      .groupBy("CustomerID", "ProductCategoryID", "ProductCategoryName")
         .agg(
           # Recency: days since the most recent purchase date in this (cust, cat) group
           fn.min(fn.datediff("GlobalLastDate", "InvoiceDate")).alias("Recency"),
