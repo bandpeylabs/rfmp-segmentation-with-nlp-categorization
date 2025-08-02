@@ -11,6 +11,10 @@ We’ll walk through a practical pipeline that:
 
 ---
 
+## Overall Workflow of E2E RFMP Segmentation
+
+![RFMP Segmentation Architecture](architecture/diagram.png)
+
 ## 💡 Why RFMP?
 
 Traditional **RFM** segmentation (Recency, Frequency, Monetary value) provides a lightweight yet powerful view into customer behavior. By extending it with **Product preferences (P)**, we can gain insights into what customers buy, not just how often or how recently they buy. This empowers:
