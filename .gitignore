@@ -193,3 +193,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Draw.io backup files
+*.drawio.bak
+
+
+# Mac OS X
+.DS_Store
